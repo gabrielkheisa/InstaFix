@@ -37,5 +37,5 @@ COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # https://docs.docker.com/engine/reference/builder/#expose
 EXPOSE 3000
 
-# Add a shell for debugging
-CMD ["/bin/sh"]
+# Run the app
+ENTRYPOINT ["/instafix"]
