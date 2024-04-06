@@ -22,8 +22,8 @@ COPY views/ ./views/
 # Build
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags '-extldflags "-static"'
 
-# Run in scratch container
-FROM scratch
+# Run in alpine base image
+FROM alpine:latest
 # the test program:
 COPY --from=app-builder /app/instafix /instafix
 # the tls certificates:
@@ -37,5 +37,5 @@ COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # https://docs.docker.com/engine/reference/builder/#expose
 EXPOSE 3000
 
-# Run the app
-ENTRYPOINT ["/instafix"]
+# Add a shell for debugging
+CMD ["/bin/sh"]
