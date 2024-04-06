@@ -1,0 +1,20 @@
+name: Docker Build and Test
+
+on:
+  push:
+    branches:
+      - main  # Change this to the branch you want to trigger the workflow on
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Build Docker image
+      run: docker build -t instafix .
+
+    - name: Run Docker container
+      run: docker run -d -p 3000:3000 instafix
