@@ -1,179 +1,123 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"instafix/handlers"
-	data "instafix/handlers/data"
+	scraper "instafix/handlers/scraper"
 	"instafix/utils"
 	"instafix/views"
-	"io/fs"
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ansrivas/fiberprometheus/v2"
-	"github.com/cockroachdb/pebble"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/pprof"
-	"github.com/gofiber/fiber/v2/middleware/recover"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"github.com/valyala/bytebufferpool"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	bolt "go.etcd.io/bbolt"
 )
 
-func byteSizeStrToInt(n string) (int64, error) {
-	sizeStr := strings.ToLower(n)
-	sizeStr = strings.TrimSpace(sizeStr)
-
-	units := map[string]int64{
-		"kb": 1024,
-		"mb": 1024 * 1024,
-		"gb": 1024 * 1024 * 1024,
-		"tb": 1024 * 1024 * 1024 * 1024,
-	}
-
-	for unit, multiplier := range units {
-		if strings.HasSuffix(sizeStr, unit) {
-			sizeStr = strings.TrimSuffix(sizeStr, unit)
-			sizeStr = strings.TrimSpace(sizeStr)
-
-			size, err := strconv.ParseInt(sizeStr, 10, 64)
-			if err != nil {
-				return -1, err
-			}
-			return size * multiplier, nil
-		}
-	}
-	return -1, nil
-}
-
 func init() {
-	data.InitDB()
-
 	// Create static folder if not exists
 	os.Mkdir("static", 0755)
 }
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:3000", "Address to listen on")
-	gridCacheSize := flag.String("grid-cache-size", "25GB", "Grid cache size")
+	gridCacheMaxFlag := flag.String("grid-cache-entries", "1024", "Maximum number of grid images to cache")
+	remoteScraperAddr := flag.String("remote-scraper", "", "Remote scraper address")
 	flag.Parse()
 
-	app := fiber.New()
-
-	recoverConfig := recover.ConfigDefault
-	recoverConfig.EnableStackTrace = true
-	app.Use(recover.New(recoverConfig))
-	app.Use(pprof.New())
-
-	// Initialize Prometheus
-	prometheus := fiberprometheus.New("InstaFix")
-	prometheus.RegisterAt(app, "/metrics")
-	app.Use(prometheus.Middleware)
-
-	// Close database when app closes
-	defer data.DB.Close()
-
-	// Initialize zerolog
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
-	// Parse grid-cache-size
-	gridCacheSizeParsed, err := byteSizeStrToInt(*gridCacheSize)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to parse grid-cache-size")
+	// Initialize remote scraper
+	if *remoteScraperAddr != "" {
+		if !strings.HasPrefix(*remoteScraperAddr, "http") {
+			panic("Remote scraper address must start with http:// or https://")
+		}
+		scraper.RemoteScraperAddr = *remoteScraperAddr
 	}
+
+	// Initialize logging
+	slog.SetLogLoggerLevel(slog.LevelError)
+
+	// Initialize LRU
+	gridCacheMax, err := strconv.Atoi(*gridCacheMaxFlag)
+	if err != nil || gridCacheMax <= 0 {
+		panic(err)
+	}
+	scraper.InitLRU(gridCacheMax)
+
+	// Initialize cache / DB
+	scraper.InitDB()
+	defer scraper.DB.Close()
 
 	// Evict cache every minute
 	go func() {
 		for {
-			evictStatic(gridCacheSizeParsed)
 			evictCache()
-			time.Sleep(time.Minute)
+			time.Sleep(5 * time.Minute)
 		}
 	}()
 
-	app.Get("/", func(c *fiber.Ctx) error {
-		viewsBuf := bytebufferpool.Get()
-		defer bytebufferpool.Put(viewsBuf)
-		c.Set("Content-Type", "text/html; charset=utf-8")
-		views.Home(viewsBuf)
-		return c.Send(viewsBuf.Bytes())
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
+
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.StripSlashes)
+
+	r.Get("/tv/{postID}", handlers.Embed)
+	r.Get("/reel/{postID}", handlers.Embed)
+	r.Get("/reels/{postID}", handlers.Embed)
+	r.Get("/stories/{username}/{postID}", handlers.Embed)
+	r.Get("/p/{postID}", handlers.Embed)
+	r.Get("/p/{postID}/{mediaNum}", handlers.Embed)
+
+	r.Get("/{username}/p/{postID}", handlers.Embed)
+	r.Get("/{username}/p/{postID}/{mediaNum}", handlers.Embed)
+	r.Get("/{username}/reel/{postID}", handlers.Embed)
+
+	r.Get("/images/{postID}/{mediaNum}", handlers.Images)
+	r.Get("/videos/{postID}/{mediaNum}", handlers.Videos)
+	r.Get("/grid/{postID}", handlers.Grid)
+	r.Get("/oembed", handlers.OEmbed)
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		views.Home(w)
 	})
-
-	// GET /p/Cw8X2wXPjiM
-	// GET /stories/fatfatpankocat/3226148677671954631/
-	app.Get("/p/:postID/", handlers.Embed())
-	app.Get("/tv/:postID", handlers.Embed())
-	app.Get("/reel/:postID", handlers.Embed())
-	app.Get("/reels/:postID", handlers.Embed())
-	app.Get("/stories/:username/:postID", handlers.Embed())
-	app.Get("/p/:postID/:mediaNum", handlers.Embed())
-	app.Get("/:username/p/:postID/", handlers.Embed())
-	app.Get("/:username/p/:postID/:mediaNum", handlers.Embed())
-
-	app.Get("/images/:postID/:mediaNum", handlers.Images())
-	app.Get("/videos/:postID/:mediaNum", handlers.Videos())
-	app.Get("/grid/:postID", handlers.Grid())
-	app.Get("/oembed", handlers.OEmbed())
-
-	app.Listen(*listenAddr)
-}
-
-// Remove file in static folder until below threshold
-func evictStatic(threshold int64) {
-	var dirSize int64 = 0
-	readSize := func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			if dirSize > threshold {
-				err := os.Remove(path)
-				return err
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			dirSize += info.Size()
-		}
-		return nil
+	if err := http.ListenAndServe(*listenAddr, r); err != nil {
+		slog.Error("Failed to listen", "err", err)
 	}
-	filepath.WalkDir("static", readSize)
 }
 
 // Remove cache from Pebble if already expired
 func evictCache() {
-	iter, err := data.DB.NewIter(&pebble.IterOptions{LowerBound: []byte("exp-")})
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to create iterator")
-		return
-	}
-	defer iter.Close()
-
-	batch := data.DB.NewBatch()
 	curTime := time.Now().UnixNano()
-	for iter.First(); iter.Valid(); iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), []byte("exp-")) {
-			continue
+	err := scraper.DB.Batch(func(tx *bolt.Tx) error {
+		ttlBucket := tx.Bucket([]byte("ttl"))
+		if ttlBucket == nil {
+			return nil
 		}
-
-		expireTimestamp := bytes.Trim(iter.Key(), "exp-")
-		if n, err := strconv.ParseInt(utils.B2S(expireTimestamp), 10, 64); err == nil {
-			if n < curTime {
-				batch.Delete(iter.Key(), pebble.NoSync)
-				batch.Delete(iter.Value(), pebble.NoSync)
+		dataBucket := tx.Bucket([]byte("data"))
+		if dataBucket == nil {
+			return nil
+		}
+		c := ttlBucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if n, err := strconv.ParseInt(utils.B2S(k), 10, 64); err == nil {
+				if n < curTime {
+					ttlBucket.Delete(k)
+					dataBucket.Delete(v)
+				}
+			} else {
+				slog.Error("Failed to parse expire timestamp in cache", "err", err)
 			}
-		} else {
-			log.Error().Err(err).Msg("Failed to parse expire timestamp")
 		}
-
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		log.Error().Err(err).Msg("Failed to commit batch")
+		return nil
+	})
+	if err != nil {
+		slog.Error("Failed to evict cache", "err", err)
 	}
 }

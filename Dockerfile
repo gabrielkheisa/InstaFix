@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:alpine as app-builder
+FROM --platform=$BUILDPLATFORM golang:1.22 as app-builder
 
 # Set destination for COPY
 WORKDIR /app
@@ -13,14 +13,18 @@ RUN go mod download
 # https://docs.docker.com/engine/reference/builder/#copy
 COPY *.go ./
 COPY handlers/ ./handlers/
-COPY handlers/data/ ./handlers/data/
-# NO-OP in case handlers/data/ was already copied previously
+COPY handlers/scraper/ ./handlers/scraper/
+# NO-OP in case handlers/scraper/ was already copied previously
 RUN true
 COPY utils/ ./utils/
 COPY views/ ./views/
 
+# This is the architecture you’re building for, which is passed in by the builder.
+# Placing it here allows the previous steps to be cached across architectures.
+ARG TARGETARCH
+
 # Build
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags '-extldflags "-static"'
+RUN GOOS=linux GOARCH=$TARGETARCH go build -tags netgo,osusergo -ldflags '-extldflags "-static"'
 
 # Run in alpine base image
 FROM alpine:latest
