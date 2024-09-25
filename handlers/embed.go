@@ -76,8 +76,7 @@ func Embed(w http.ResponseWriter, r *http.Request) {
 
 	item, err := scraper.GetData(postID)
 	if err != nil || len(item.Medias) == 0 {
-		viewsData.Description = "Post might not be available"
-		views.Embed(viewsData, w)
+		http.Redirect(w, r, viewsData.URL, http.StatusFound)
 		return
 	}
 
@@ -125,14 +124,17 @@ func Embed(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString("/")
 		sb.WriteString(strconv.Itoa(max(1, mediaNum)))
 		viewsData.VideoURL = sb.String()
-		viewsData.OEmbedURL = r.Host + "/oembed?text=" + url.QueryEscape(viewsData.Description) + "&url=" + viewsData.URL
-	}
 
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		viewsData.OEmbedURL = scheme + "://" + r.Host + "/oembed?text=" + url.QueryEscape(viewsData.Description) + "&url=" + viewsData.URL
+	}
 	if isDirect {
 		http.Redirect(w, r, sb.String(), http.StatusFound)
 		return
 	}
 
 	views.Embed(viewsData, w)
-	return
 }

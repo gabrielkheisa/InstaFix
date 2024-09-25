@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/PurpleSec/escape"
 	"github.com/kelindar/binary"
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/klauspost/compress/zstd"
@@ -33,6 +32,7 @@ var (
 	transport         http.RoundTripper
 	transportNoProxy  *http.Transport
 	sflightScraper    singleflight.Group
+	remoteZSTDReader  *zstd.Decoder
 )
 
 //go:embed dictionary.bin
@@ -51,13 +51,19 @@ type InstaData struct {
 }
 
 func init() {
+	var err error
 	transport = gzhttp.Transport(http.DefaultTransport, gzhttp.TransportAlwaysDecompress(true))
 	transportNoProxy = http.DefaultTransport.(*http.Transport).Clone()
 	transportNoProxy.Proxy = nil // Skip any proxy
+
+	remoteZSTDReader, err = zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderDicts(zstdDict))
+	if err != nil {
+		panic(err)
+	}
 }
 
 func GetData(postID string) (*InstaData, error) {
-	if len(postID) == 0 || postID[0] != 'C' {
+	if len(postID) == 0 || (postID[0] != 'C' && postID[0] != 'D') {
 		return nil, errors.New("postID is not a valid Instagram post ID")
 	}
 
@@ -142,7 +148,6 @@ func GetData(postID string) (*InstaData, error) {
 func (i *InstaData) ScrapeData() error {
 	// Scrape from remote scraper if available
 	if len(RemoteScraperAddr) > 0 {
-		var err error
 		remoteClient := http.Client{Transport: transportNoProxy, Timeout: timeout}
 		req, err := http.NewRequest("GET", RemoteScraperAddr+"/scrape/"+i.PostID, nil)
 		if err != nil {
@@ -150,19 +155,15 @@ func (i *InstaData) ScrapeData() error {
 		}
 		req.Header.Set("Accept-Encoding", "zstd.dict")
 		res, err := remoteClient.Do(req)
-		if res != nil && res.StatusCode == 200 {
+		if err == nil && res != nil {
 			defer res.Body.Close()
-			zstdReader, err := zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderDicts(zstdDict))
-			if err != nil {
-				return err
-			}
 			remoteData, err := io.ReadAll(res.Body)
-			if err == nil {
-				remoteDecomp, err := zstdReader.DecodeAll(remoteData, nil)
+			if err == nil && res.StatusCode == 200 {
+				remoteDecomp, err := remoteZSTDReader.DecodeAll(remoteData, nil)
 				if err != nil {
 					return err
 				}
-				if err = binary.Unmarshal(remoteDecomp, i); err == nil {
+				if err := binary.Unmarshal(remoteDecomp, i); err == nil {
 					if len(i.Username) > 0 {
 						slog.Info("Data parsed from remote scraper", "postID", i.PostID)
 						return nil
@@ -170,6 +171,9 @@ func (i *InstaData) ScrapeData() error {
 				}
 			}
 			slog.Error("Failed to scrape data from remote scraper", "postID", i.PostID, "status", res.StatusCode, "err", err)
+		}
+		if err != nil {
+			slog.Error("Failed when trying to scrape data from remote scraper", "postID", i.PostID, "err", err)
 		}
 	}
 
@@ -181,13 +185,24 @@ func (i *InstaData) ScrapeData() error {
 
 	var body []byte
 	for retries := 0; retries < 3; retries++ {
-		res, err := client.Do(req)
-		if res != nil && res.StatusCode == 200 {
-			defer res.Body.Close()
-			body, err = io.ReadAll(res.Body)
-			if err == nil && len(body) > 0 {
-				break
+		err := func() error {
+			res, err := client.Do(req)
+			if err != nil {
+				return err
 			}
+			defer res.Body.Close()
+			if res.StatusCode != 200 {
+				return errors.New("status code is not 200")
+			}
+
+			body, err = io.ReadAll(res.Body)
+			if err != nil {
+				return err
+			}
+			return nil
+		}()
+		if err == nil {
+			break
 		}
 	}
 
@@ -234,14 +249,14 @@ func (i *InstaData) ScrapeData() error {
 	}
 
 	var gqlData gjson.Result
-	videoBlocked := strings.Contains(utils.B2S(body), "WatchOnInstagram")
+	videoBlocked := bytes.Contains(body, []byte("WatchOnInstagram"))
 	// Scrape from GraphQL API only if video is blocked or embed data is empty
 	if videoBlocked || len(body) == 0 {
 		gqlValue, err := scrapeFromGQL(i.PostID)
 		if err != nil {
 			slog.Error("Failed to scrape data from scrapeFromGQL", "postID", i.PostID, "err", err)
 		}
-		if gqlValue != nil && !strings.Contains(utils.B2S(gqlValue), "require_login") {
+		if gqlValue != nil && !bytes.Contains(gqlValue, []byte("require_login")) {
 			gqlData = gjson.Parse(utils.B2S(gqlValue)).Get("data")
 			slog.Info("Data parsed from GraphQL API", "postID", i.PostID)
 		}
@@ -369,7 +384,7 @@ func scrapeFromEmbedHTML(embedHTML []byte) (string, error) {
 		"shortcode_media": {
 			"owner": {"username": "` + username + `"},
 			"node": {"__typename": "` + typename + `", "display_url": "` + mediaURL + `"},
-			"edge_media_to_caption": {"edges": [{"node": {"text": ` + escape.JSON(caption) + `}}]},
+			"edge_media_to_caption": {"edges": [{"node": {"text": ` + utils.EscapeJSONString(caption) + `}}]},
 			"dimensions": {"height": null, "width": null},
 			"video_blocked": ` + videoBlocked + `
 		}

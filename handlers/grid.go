@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"image"
 	"image/jpeg"
 	scraper "instafix/handlers/scraper"
@@ -106,6 +107,9 @@ func GenerateGrid(images []image.Image) (image.Image, error) {
 	var heightRows []int
 	// Calculate height of each row and canvas height
 	for i := 1; i < len(path); i++ {
+		if len(imagesWH) < path[i-1] {
+			return nil, errors.New("imagesWH is not long enough")
+		}
 		rowWH := imagesWH[path[i-1]:path[i]]
 
 		rowHeight := int(getHeight(rowWH, canvasWidth))
@@ -119,6 +123,9 @@ func GenerateGrid(images []image.Image) (image.Image, error) {
 	for i := 1; i < len(path); i++ {
 		inRow := images[path[i-1]:path[i]]
 		oldImWidth := 0
+		if len(heightRows) < i {
+			return nil, errors.New("heightRows is not long enough")
+		}
 		heightRow := heightRows[i-1]
 		for _, imageOne := range inRow {
 			newWidth := float64(heightRow) * float64(imageOne.Bounds().Dx()) / float64(imageOne.Bounds().Dy())
@@ -134,20 +141,23 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 	postID := chi.URLParam(r, "postID")
 	gridFname := filepath.Join("static", postID+".jpeg")
 
-	// If already exists, return
+	// If already exists, return from cache
 	if _, ok := scraper.LRU.Get(gridFname); ok {
 		f, err := os.Open(gridFname)
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if err == nil {
+			defer f.Close()
+			w.Header().Set("Content-Type", "image/jpeg")
+			io.Copy(w, f)
 			return
 		}
-		defer f.Close()
-		w.Header().Set("Content-Type", "image/jpeg")
-		io.Copy(w, f)
-		return
 	}
 
 	item, err := scraper.GetData(postID)
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -217,15 +227,16 @@ func Grid(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	f, err := os.Open(gridFname)
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "image/jpeg")
 	io.Copy(w, f)
-	return
 }
